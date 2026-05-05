@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+data/*.db
+data/*.db-shm
+data/*.db-wal
+data/*.log
+!.gitignore
+!data/.gitkeep
+!scripts/README.md
