@@ -329,6 +329,18 @@ def collect_matched_items(items: list[dict[str, Any]], delete_targets: Iterable[
     return matched
 
 
+def existing_top_items_for_names(items: list[dict[str, Any]], names: Iterable[str]) -> list[dict[str, Any]]:
+    wanted = [str(name).strip() for name in names if str(name).strip()]
+    if not wanted:
+        return []
+    by_name: dict[str, dict[str, Any]] = {}
+    for item in items:
+        name = str(item.get("file_name") or "").strip()
+        if name and name not in by_name:
+            by_name[name] = item
+    return [by_name[name] for name in wanted if name in by_name]
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Local test that ports xinyue-search's Quark transfer and deletion logic."
@@ -401,6 +413,7 @@ def main() -> int:
         share_items = detail.get("list") or []
         if not isinstance(share_items, list) or not share_items:
             raise ScriptError("Quark share detail returned no items.")
+        share_top_names = [str(item.get("file_name") or "").strip() for item in share_items if str(item.get("file_name") or "").strip()]
 
         fid_list = [str(item.get("fid") or "") for item in share_items if str(item.get("fid") or "").strip()]
         fid_token_list = [
@@ -411,16 +424,27 @@ def main() -> int:
         if not fid_list or len(fid_list) != len(fid_token_list):
             raise ScriptError("Quark share detail is missing fid or share_fid_token.")
 
-        task_id = client.share_save(pwd_id, stoken, fid_list, fid_token_list)
-        task_data = client.wait_for_task(task_id)
+        existing_top_items = existing_top_items_for_names(before_items, share_top_names)
+        resumed_existing = bool(share_top_names) and len(existing_top_items) == len(share_top_names)
+        if resumed_existing:
+            top_fids = [
+                str(item.get("fid") or "")
+                for item in existing_top_items
+                if str(item.get("fid") or "").strip()
+            ]
+            after_items = before_items
+            new_top_items = existing_top_items
+        else:
+            task_id = client.share_save(pwd_id, stoken, fid_list, fid_token_list)
+            task_data = client.wait_for_task(task_id)
 
-        top_fids = [str(item) for item in ((task_data.get("save_as") or {}).get("save_as_top_fids") or []) if str(item).strip()]
-        after_items = client.list_dir(client.save_fid)
-        new_top_items = [
-            item
-            for item in after_items
-            if str(item.get("fid") or "").strip() and str(item.get("fid") or "") not in before_fids
-        ]
+            top_fids = [str(item) for item in ((task_data.get("save_as") or {}).get("save_as_top_fids") or []) if str(item).strip()]
+            after_items = client.list_dir(client.save_fid)
+            new_top_items = [
+                item
+                for item in after_items
+                if str(item.get("fid") or "").strip() and str(item.get("fid") or "") not in before_fids
+            ]
 
         cleanup_root: dict[str, Any] | None = None
         if len(new_top_items) == 1:
@@ -487,6 +511,7 @@ def main() -> int:
             "save_fid": client.save_fid,
             "share_title": str((detail.get("share") or {}).get("title") or ""),
             "dry_run": args.dry_run,
+            "resumed_existing_transfer": resumed_existing,
             "new_top_level_names": [str(item.get("file_name") or "") for item in new_top_items],
             "cleanup_root_name": cleanup_root_name,
             "cleanup_root_fid": cleanup_root_fid,

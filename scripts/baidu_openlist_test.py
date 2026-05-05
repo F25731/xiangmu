@@ -611,6 +611,18 @@ def collect_deletions(entries: list[Entry], delete_targets: Iterable[str]) -> li
     return matched
 
 
+def existing_entries_for_names(entries: list[dict[str, Any]], names: Iterable[str]) -> list[dict[str, Any]]:
+    wanted = [str(name).strip() for name in names if str(name).strip()]
+    if not wanted:
+        return []
+    by_name: dict[str, dict[str, Any]] = {}
+    for entry in entries:
+        name = str(entry.get("server_filename") or "").strip()
+        if name and name not in by_name:
+            by_name[name] = entry
+    return [by_name[name] for name in wanted if name in by_name]
+
+
 def infer_cleanup_path(
     openlist: OpenListClient,
     transfer_dir: str,
@@ -787,21 +799,27 @@ def main() -> int:
         before_entries = baidu.get_dir_list(baidu_transfer_dir)
         before_names = {str(item.get("server_filename") or "") for item in before_entries}
 
-        baidu.transfer_file(
-            share_id=str(transfer_params["share_id"]),
-            user_id=str(transfer_params["user_id"]),
-            fs_ids=[str(item) for item in transfer_params["fs_ids"]],
-            target_dir=baidu_transfer_dir,
-        )
-        openlist.wait_for_path(
-            openlist_transfer_dir,
-            retry_seconds=args.retry_seconds,
-            max_wait_seconds=args.max_wait_seconds,
-        )
+        existing_entries = existing_entries_for_names(before_entries, transfer_params["file_names"])
+        resumed_existing = bool(transfer_params["file_names"]) and len(existing_entries) == len(transfer_params["file_names"])
+        if resumed_existing:
+            after_entries = before_entries
+            new_names = [str(item.get("server_filename") or "") for item in existing_entries]
+        else:
+            baidu.transfer_file(
+                share_id=str(transfer_params["share_id"]),
+                user_id=str(transfer_params["user_id"]),
+                fs_ids=[str(item) for item in transfer_params["fs_ids"]],
+                target_dir=baidu_transfer_dir,
+            )
+            openlist.wait_for_path(
+                openlist_transfer_dir,
+                retry_seconds=args.retry_seconds,
+                max_wait_seconds=args.max_wait_seconds,
+            )
 
-        after_entries = baidu.get_dir_list(baidu_transfer_dir)
-        after_names = {str(item.get("server_filename") or "") for item in after_entries}
-        new_names = sorted(name for name in after_names if name and name not in before_names)
+            after_entries = baidu.get_dir_list(baidu_transfer_dir)
+            after_names = {str(item.get("server_filename") or "") for item in after_entries}
+            new_names = sorted(name for name in after_names if name and name not in before_names)
 
         cleanup_path = (
             normalize_posix_path(args.cleanup_path)
@@ -856,6 +874,7 @@ def main() -> int:
             "openlist_transfer_dir": openlist_transfer_dir,
             "cleanup_path": cleanup_path,
             "dry_run": args.dry_run,
+            "resumed_existing_transfer": resumed_existing,
             "transferred_top_level_names": new_names,
             "parsed_share_file_names": transfer_params["file_names"],
             "delete_targets": delete_targets,
