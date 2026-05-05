@@ -373,7 +373,7 @@ def row_to_resource(row: sqlite3.Row) -> dict[str, Any]:
             item[key] = json.loads(item[key])
         except (TypeError, json.JSONDecodeError):
             item[key] = {} if key != "provider_links" else []
-    item["intro"] = clean_resource_intro(str(item.get("intro") or ""))
+    item["intro"] = ensure_intro_punctuation(clean_resource_intro(str(item.get("intro") or "")))
     return item
 
 
@@ -434,13 +434,22 @@ def clean_resource_intro(text: str) -> str:
     positions = [intro.find(marker) for marker in markers if marker in intro]
     if positions:
         intro = intro[: min(positions)]
-    return clean_text(intro).rstrip("，,。；;：:")
+    return clean_text(intro)
+
+
+def ensure_intro_punctuation(text: str) -> str:
+    intro = clean_text(text)
+    if not intro:
+        return ""
+    if re.search(r"[。！？!?…）)」』》]$", intro):
+        return intro
+    return f"{intro}。"
 
 
 def sanitize_existing_intros(conn: sqlite3.Connection) -> None:
     rows = conn.execute("select id, intro from resources").fetchall()
     for row in rows:
-        cleaned = clean_resource_intro(str(row["intro"] or ""))
+        cleaned = ensure_intro_punctuation(clean_resource_intro(str(row["intro"] or "")))
         if cleaned != str(row["intro"] or ""):
             conn.execute(
                 "update resources set intro = ?, updated_at = ? where id = ?",
@@ -455,7 +464,7 @@ def sanitize_existing_intros(conn: sqlite3.Connection) -> None:
             continue
         if not isinstance(item, dict):
             continue
-        cleaned = clean_resource_intro(str(item.get("intro") or ""))
+        cleaned = ensure_intro_punctuation(clean_resource_intro(str(item.get("intro") or "")))
         if cleaned != str(item.get("intro") or ""):
             item["intro"] = cleaned
             conn.execute(
@@ -544,7 +553,7 @@ def extract_intro(container: Tag, title: str) -> str:
         if after_intro or len(text) > 18:
             lines.append(text)
     intro = " ".join(lines)
-    return clean_resource_intro(intro)[:1000]
+    return ensure_intro_punctuation(clean_resource_intro(intro))[:1000]
 
 
 def parse_resources(html: str, base_url: str, limit: int) -> list[dict[str, Any]]:
@@ -822,7 +831,7 @@ def insert_transferred_resource(item: dict[str, Any], links: list[dict[str, Any]
     stamp = now_iso()
     if isinstance(links, dict):
         links = [links]
-    item["intro"] = clean_resource_intro(str(item.get("intro") or ""))
+    item["intro"] = ensure_intro_punctuation(clean_resource_intro(str(item.get("intro") or "")))
     new_links = links_to_new_links(links)
     with db() as conn:
         conn.execute(
@@ -999,7 +1008,7 @@ async def retry_failures_once(config: dict[str, Any]) -> tuple[int, int]:
     log_event("info", f"开始重试失败队列：{len(rows)} 条")
     for row in rows:
         item = json.loads(row["item_json"])
-        item["intro"] = clean_resource_intro(str(item.get("intro") or ""))
+        item["intro"] = ensure_intro_punctuation(clean_resource_intro(str(item.get("intro") or "")))
         provider = str(row["provider"] or "")
         item["provider_links"] = [
             link
