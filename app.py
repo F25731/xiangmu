@@ -300,6 +300,7 @@ def init_db() -> None:
                     "insert into config(key, value) values(?, ?)",
                     (key, json.dumps(value, ensure_ascii=False)),
                 )
+        sanitize_existing_intros(conn)
 
 
 def load_config() -> dict[str, Any]:
@@ -372,6 +373,7 @@ def row_to_resource(row: sqlite3.Row) -> dict[str, Any]:
             item[key] = json.loads(item[key])
         except (TypeError, json.JSONDecodeError):
             item[key] = {} if key != "provider_links" else []
+    item["intro"] = clean_resource_intro(str(item.get("intro") or ""))
     return item
 
 
@@ -410,6 +412,56 @@ def mark_delivered(client_id: str, resource_ids: list[int]) -> None:
 
 def clean_text(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").strip()
+
+
+def clean_resource_intro(text: str) -> str:
+    intro = clean_text(text)
+    if not intro:
+        return ""
+    markers = (
+        "（点击下面网盘链接",
+        "(点击下面网盘链接",
+        "点击下面网盘链接",
+        "默认提取码",
+        "📮 下载教程",
+        "下载教程：",
+        "下载教程:",
+        "🧿",
+        "🗣 联系我们",
+        "联系我们 / 活动线报",
+        "活动线报",
+    )
+    positions = [intro.find(marker) for marker in markers if marker in intro]
+    if positions:
+        intro = intro[: min(positions)]
+    return clean_text(intro).rstrip("，,。；;：:")
+
+
+def sanitize_existing_intros(conn: sqlite3.Connection) -> None:
+    rows = conn.execute("select id, intro from resources").fetchall()
+    for row in rows:
+        cleaned = clean_resource_intro(str(row["intro"] or ""))
+        if cleaned != str(row["intro"] or ""):
+            conn.execute(
+                "update resources set intro = ?, updated_at = ? where id = ?",
+                (cleaned, now_iso(), row["id"]),
+            )
+
+    failures = conn.execute("select id, item_json from transfer_failures").fetchall()
+    for row in failures:
+        try:
+            item = json.loads(row["item_json"])
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(item, dict):
+            continue
+        cleaned = clean_resource_intro(str(item.get("intro") or ""))
+        if cleaned != str(item.get("intro") or ""):
+            item["intro"] = cleaned
+            conn.execute(
+                "update transfer_failures set item_json = ?, updated_at = ? where id = ?",
+                (json.dumps(item, ensure_ascii=False), now_iso(), row["id"]),
+            )
 
 
 def provider_for_url(url: str) -> str:
@@ -492,7 +544,7 @@ def extract_intro(container: Tag, title: str) -> str:
         if after_intro or len(text) > 18:
             lines.append(text)
     intro = " ".join(lines)
-    return intro[:1000]
+    return clean_resource_intro(intro)[:1000]
 
 
 def parse_resources(html: str, base_url: str, limit: int) -> list[dict[str, Any]]:
@@ -770,6 +822,7 @@ def insert_transferred_resource(item: dict[str, Any], links: list[dict[str, Any]
     stamp = now_iso()
     if isinstance(links, dict):
         links = [links]
+    item["intro"] = clean_resource_intro(str(item.get("intro") or ""))
     new_links = links_to_new_links(links)
     with db() as conn:
         conn.execute(
@@ -946,6 +999,7 @@ async def retry_failures_once(config: dict[str, Any]) -> tuple[int, int]:
     log_event("info", f"开始重试失败队列：{len(rows)} 条")
     for row in rows:
         item = json.loads(row["item_json"])
+        item["intro"] = clean_resource_intro(str(item.get("intro") or ""))
         provider = str(row["provider"] or "")
         item["provider_links"] = [
             link
