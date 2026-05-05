@@ -49,7 +49,7 @@
     }
     .status {
       display: grid;
-      grid-template-columns: repeat(4, 1fr);
+      grid-template-columns: repeat(5, 1fr);
       gap: 10px;
     }
     .metric { border: 1px solid #ddd; padding: 12px; background: #fbfbfa; }
@@ -85,6 +85,28 @@
     .item p { margin: 0 0 8px; color: #555; }
     .links { display: flex; flex-wrap: wrap; gap: 8px; }
     .links a { color: #0b57d0; text-decoration: none; }
+    .logbox {
+      height: 260px;
+      overflow: auto;
+      background: #111;
+      color: #e7e7e7;
+      padding: 12px;
+      font-family: Consolas, monospace;
+      font-size: 12px;
+      white-space: pre-wrap;
+    }
+    .table {
+      width: 100%;
+      border-collapse: collapse;
+    }
+    .table th,
+    .table td {
+      border-top: 1px solid #e4e4df;
+      padding: 9px 8px;
+      text-align: left;
+      vertical-align: top;
+    }
+    .table th { color: #555; font-weight: normal; }
     .modal {
       position: fixed;
       inset: 0;
@@ -131,14 +153,13 @@
         <div class="status">
           <div class="metric"><span>资源</span><strong id="total">0</strong></div>
           <div class="metric"><span>已转存</span><strong id="transferred">0</strong></div>
+          <div class="metric"><span>失败队列</span><strong id="failures">0</strong></div>
           <div class="metric"><span>上次新增</span><strong id="inserted">0</strong></div>
           <div class="metric"><span>状态</span><strong id="running">-</strong></div>
         </div>
         <div class="actions">
           <button id="firstBtn">首次抓取</button>
           <button id="scanBtn" class="secondary">扫描更新</button>
-          <button id="startBtn" class="secondary">启动定时</button>
-          <button id="stopBtn" class="ghost">停止定时</button>
         </div>
         <div class="message" id="message"></div>
       </section>
@@ -146,13 +167,23 @@
       <section>
         <h2>当前策略</h2>
         <p class="hint" id="summary">读取中...</p>
-        <p class="hint">首次抓取按你设置的 N 条导入；后续定时只扫描最新列表，发现没入库的新资源才抓取。</p>
+        <p class="hint">服务会按间隔强制定时扫描。抓到资源后必须先转存到你的网盘，成功后才入库；失败会进队列，下一轮按顺序重试。</p>
       </section>
     </div>
 
     <section>
-      <h2>最近资源</h2>
+      <h2>已转存资源</h2>
       <div id="items"></div>
+    </section>
+
+    <section>
+      <h2>失败队列</h2>
+      <div id="failureItems"></div>
+    </section>
+
+    <section>
+      <h2>实时详情</h2>
+      <div id="logs" class="logbox">读取中...</div>
     </section>
   </main>
 
@@ -177,9 +208,6 @@
           <input id="fetch_interval_seconds" type="number" min="60">
         </div>
       </div>
-
-      <label><input id="enabled" type="checkbox" style="width:auto"> 启用定时扫描</label>
-      <label><input id="auto_transfer" type="checkbox" style="width:auto"> 新资源自动转存</label>
 
       <div class="form-row">
         <div>
@@ -241,21 +269,17 @@
     async function loadConfig() {
       currentConfig = await api("/api/config");
       for (const key of fields) $(key).value = currentConfig[key] ?? "";
-      $("enabled").checked = !!currentConfig.enabled;
-      $("auto_transfer").checked = !!currentConfig.auto_transfer;
       $("delete_names").value = (currentConfig.delete_names || []).join("\n");
       renderSummary();
     }
     function renderSummary() {
-      $("summary").textContent = `来源：${currentConfig.source_url || "-"}；间隔：${currentConfig.fetch_interval_seconds || "-"} 秒；首次：${currentConfig.first_run_limit || "-"} 条；自动转存：${currentConfig.auto_transfer ? "开" : "关"}`;
+      $("summary").textContent = `来源：${currentConfig.source_url || "-"}；间隔：${currentConfig.fetch_interval_seconds || "-"} 秒；首次：${currentConfig.first_run_limit || "-"} 条；强制转存：开`;
     }
     async function saveConfig() {
       const payload = {};
       for (const key of fields) payload[key] = $(key).value;
       for (const key of ["first_run_limit", "fetch_interval_seconds"]) payload[key] = Number(payload[key]);
       payload.request_delay_seconds = Number(payload.request_delay_seconds);
-      payload.enabled = $("enabled").checked;
-      payload.auto_transfer = $("auto_transfer").checked;
       payload.delete_names = $("delete_names").value.split("\n").map(x => x.trim()).filter(Boolean);
       currentConfig = await api("/api/config", { method: "POST", body: JSON.stringify(payload) });
       msg("配置已保存");
@@ -264,28 +288,54 @@
       await refresh();
     }
     function renderItems(items) {
+      if (!items.length) {
+        $("items").innerHTML = `<p class="hint">暂无已转存资源。</p>`;
+        return;
+      }
       $("items").innerHTML = items.map(item => {
-        const original = (item.provider_links || []).map(link => `<a href="${link.url}" target="_blank">${link.provider}${link.code ? " " + link.code : ""}</a>`).join("");
-        const newer = Object.entries(item.new_links || {}).map(([name, link]) => `<a href="${link.url}" target="_blank">新${name}${link.code ? " " + link.code : ""}</a>`).join("");
+        const newer = Object.entries(item.new_links || {}).map(([name, link]) => `<a href="${link.url}" target="_blank">${name}${link.code ? " " + link.code : ""}</a>`).join("");
         return `<div class="item">
           ${item.image_url ? `<img class="thumb" src="${item.image_url}">` : `<div class="thumb"></div>`}
           <div>
             <h3>${item.title}</h3>
             <p>${item.intro || ""}</p>
-            <div class="links">${original}${newer}</div>
+            <div class="links">${newer}</div>
           </div>
         </div>`;
       }).join("");
+    }
+    function renderFailures(items) {
+      if (!items.length) {
+        $("failureItems").innerHTML = `<p class="hint">暂无失败。</p>`;
+        return;
+      }
+      $("failureItems").innerHTML = `<table class="table">
+        <thead><tr><th>资源</th><th>网盘</th><th>重试</th><th>错误</th></tr></thead>
+        <tbody>${items.map(item => `<tr>
+          <td>${item.title}</td>
+          <td>${item.provider}</td>
+          <td>${item.retry_count}</td>
+          <td>${item.last_error}</td>
+        </tr>`).join("")}</tbody>
+      </table>`;
+    }
+    function renderLogs(items) {
+      $("logs").textContent = items.map(item => `[${item.created_at}] ${item.level.toUpperCase()} ${item.message}`).join("\n") || "暂无日志";
     }
     async function refresh() {
       const status = await api("/api/status");
       $("total").textContent = status.total_resources;
       $("transferred").textContent = status.transferred_resources;
+      $("failures").textContent = status.failure_resources;
       $("inserted").textContent = status.last_inserted;
-      $("running").textContent = status.busy ? "忙" : (status.running ? "开" : "停");
+      $("running").textContent = status.busy ? "忙" : "定时";
       if (status.last_error) msg(status.last_error);
-      const resources = await api("/api/resources?limit=30");
+      const resources = await api("/api/resources?limit=100");
       renderItems(resources.items || []);
+      const failures = await api("/api/failures?limit=100");
+      renderFailures(failures.items || []);
+      const events = await api("/api/events?limit=120");
+      renderLogs(events.items || []);
     }
     $("configBtn").onclick = () => $("configModal").classList.add("open");
     $("closeConfig").onclick = () => $("configModal").classList.remove("open");
@@ -295,16 +345,14 @@
     $("saveBtn").onclick = () => saveConfig().catch(e => msg(e.message));
     $("scanBtn").onclick = async () => {
       msg("扫描更新中...");
-      await api("/api/run", { method: "POST", body: JSON.stringify({ transfer: currentConfig.auto_transfer }) }).catch(e => msg(e.message));
+      await api("/api/run", { method: "POST", body: JSON.stringify({}) }).catch(e => msg(e.message));
       await refresh();
     };
     $("firstBtn").onclick = async () => {
       msg("首次抓取中...");
-      await api("/api/run", { method: "POST", body: JSON.stringify({ limit: Number(currentConfig.first_run_limit || 20), transfer: currentConfig.auto_transfer }) }).catch(e => msg(e.message));
+      await api("/api/run", { method: "POST", body: JSON.stringify({ limit: Number(currentConfig.first_run_limit || 20) }) }).catch(e => msg(e.message));
       await refresh();
     };
-    $("startBtn").onclick = async () => { currentConfig = await api("/api/start", { method: "POST" }); await loadConfig(); await refresh(); };
-    $("stopBtn").onclick = async () => { currentConfig = await api("/api/stop", { method: "POST" }); await loadConfig(); await refresh(); };
     loadConfig().then(refresh).catch(e => msg(e.message));
     setInterval(refresh, 10000);
   </script>
