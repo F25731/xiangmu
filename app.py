@@ -33,6 +33,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "enabled": False,
     "auto_transfer": False,
     "first_run_limit": 20,
+    "scan_limit": 80,
     "fetch_limit": 20,
     "fetch_interval_seconds": 1800,
     "request_delay_seconds": 2.0,
@@ -69,6 +70,7 @@ class ConfigIn(BaseModel):
     enabled: Optional[bool] = None
     auto_transfer: Optional[bool] = None
     first_run_limit: Optional[int] = Field(default=None, ge=1, le=500)
+    scan_limit: Optional[int] = Field(default=None, ge=1, le=500)
     fetch_limit: Optional[int] = Field(default=None, ge=1, le=500)
     fetch_interval_seconds: Optional[int] = Field(default=None, ge=60, le=86400)
     request_delay_seconds: Optional[float] = Field(default=None, ge=0.5, le=60)
@@ -568,7 +570,7 @@ def transfer_resource(resource: dict[str, Any], config: dict[str, Any], provider
 async def run_fetch_once(limit: Optional[int] = None, transfer: Optional[bool] = None) -> dict[str, Any]:
     async with fetch_lock:
         config = load_config()
-        run_limit = int(limit or config.get("fetch_limit") or 20)
+        run_limit = int(limit or config.get("scan_limit") or config.get("fetch_limit") or 80)
         should_transfer = bool(config.get("auto_transfer") if transfer is None else transfer)
         runtime_status.update(
             {
@@ -634,7 +636,7 @@ async def scheduler_loop() -> None:
         interval = int(config.get("fetch_interval_seconds") or 1800)
         if runtime_status["running"] and not runtime_status["busy"]:
             try:
-                await run_fetch_once(int(config.get("fetch_limit") or 20), None)
+                await run_fetch_once(int(config.get("scan_limit") or config.get("fetch_limit") or 80), None)
             except Exception:
                 pass
         next_ts = time.time() + interval
@@ -658,7 +660,7 @@ async def on_shutdown() -> None:
 
 @app.get("/", response_class=HTMLResponse)
 async def index() -> str:
-    return INDEX_HTML
+    return (APP_DIR / "static" / "index.html").read_text(encoding="utf-8")
 
 
 @app.get("/api/config", dependencies=[Depends(require_admin)])
@@ -743,255 +745,3 @@ async def api_transfer(resource_id: int, payload: TransferIn) -> Dict[str, Any]:
     resource = row_to_resource(row)
     links = await asyncio.to_thread(transfer_resource, resource, config, payload.providers)
     return {"new_links": links}
-
-
-INDEX_HTML = r"""
-<!doctype html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>资源抓取控制台</title>
-  <style>
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      background: #f7f7f5;
-      color: #202124;
-      font-family: "Microsoft YaHei", Arial, sans-serif;
-      font-size: 14px;
-      line-height: 1.55;
-    }
-    button, input, textarea { font: inherit; }
-    button {
-      border: 1px solid #202124;
-      background: #202124;
-      color: #fff;
-      padding: 8px 12px;
-      cursor: pointer;
-    }
-    button.secondary { background: transparent; color: #202124; }
-    button:disabled { opacity: .5; cursor: not-allowed; }
-    main {
-      width: min(1180px, calc(100% - 32px));
-      margin: 34px auto 60px;
-      display: grid;
-      grid-template-columns: 360px 1fr;
-      gap: 24px;
-      align-items: start;
-    }
-    h1 { margin: 0 0 20px; font-size: 24px; }
-    h2 { margin: 0 0 14px; font-size: 16px; }
-    section {
-      background: #fff;
-      border: 1px solid #ddd;
-      padding: 18px;
-      margin-bottom: 16px;
-    }
-    label { display: block; margin: 12px 0 5px; color: #555; }
-    input, textarea {
-      width: 100%;
-      border: 1px solid #ccc;
-      background: #fff;
-      padding: 8px 10px;
-      color: #202124;
-    }
-    textarea { min-height: 86px; resize: vertical; }
-    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-    .actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
-    .status {
-      display: grid;
-      grid-template-columns: repeat(4, 1fr);
-      gap: 10px;
-    }
-    .metric { border: 1px solid #ddd; padding: 12px; background: #fbfbfa; }
-    .metric strong { display: block; font-size: 20px; }
-    .item {
-      border-top: 1px solid #e3e3e0;
-      padding: 14px 0;
-      display: grid;
-      grid-template-columns: 92px 1fr;
-      gap: 14px;
-    }
-    .thumb {
-      width: 92px;
-      aspect-ratio: 4 / 3;
-      object-fit: cover;
-      background: #eee;
-      border: 1px solid #ddd;
-    }
-    .item h3 { margin: 0 0 6px; font-size: 15px; }
-    .item p { margin: 0 0 8px; color: #555; }
-    .links { display: flex; flex-wrap: wrap; gap: 8px; }
-    .links a { color: #0b57d0; text-decoration: none; }
-    .message { min-height: 20px; color: #555; margin-top: 10px; }
-    @media (max-width: 880px) {
-      main { grid-template-columns: 1fr; }
-      .status { grid-template-columns: repeat(2, 1fr); }
-    }
-  </style>
-</head>
-<body>
-  <main>
-    <div>
-      <h1>资源抓取控制台</h1>
-      <section>
-        <h2>运行</h2>
-        <div class="status">
-          <div class="metric"><span>资源</span><strong id="total">0</strong></div>
-          <div class="metric"><span>已转存</span><strong id="transferred">0</strong></div>
-          <div class="metric"><span>上次新增</span><strong id="inserted">0</strong></div>
-          <div class="metric"><span>状态</span><strong id="running">-</strong></div>
-        </div>
-        <div class="actions">
-          <button id="runBtn">立即抓取</button>
-          <button id="firstBtn" class="secondary">首次抓取 N 条</button>
-          <button id="startBtn" class="secondary">启动定时</button>
-          <button id="stopBtn" class="secondary">停止定时</button>
-        </div>
-        <div class="message" id="message"></div>
-      </section>
-
-      <section>
-        <h2>基础配置</h2>
-        <label>来源地址</label>
-        <input id="source_url">
-        <div class="row">
-          <div>
-            <label>首次抓取条数</label>
-            <input id="first_run_limit" type="number" min="1">
-          </div>
-          <div>
-            <label>每次抓取条数</label>
-            <input id="fetch_limit" type="number" min="1">
-          </div>
-        </div>
-        <div class="row">
-          <div>
-            <label>抓取间隔秒</label>
-            <input id="fetch_interval_seconds" type="number" min="60">
-          </div>
-          <div>
-            <label>请求间隔秒</label>
-            <input id="request_delay_seconds" type="number" min="0.5" step="0.5">
-          </div>
-        </div>
-        <label><input id="enabled" type="checkbox" style="width:auto"> 启用定时抓取</label>
-        <label><input id="auto_transfer" type="checkbox" style="width:auto"> 新资源自动转存</label>
-      </section>
-
-      <section>
-        <h2>网盘配置</h2>
-        <label>夸克 Cookie</label>
-        <textarea id="quark_cookie"></textarea>
-        <label>夸克保存目录 fid</label>
-        <input id="quark_save_fid">
-        <label>百度 Cookie</label>
-        <textarea id="baidu_cookie"></textarea>
-        <label>百度新分享提取码</label>
-        <input id="baidu_new_share_code">
-        <label>百度转存目录</label>
-        <input id="baidu_transfer_dir">
-        <label>OpenList 地址</label>
-        <input id="openlist_url">
-        <label>OpenList Token</label>
-        <textarea id="openlist_token"></textarea>
-        <label>OpenList 百度挂载根目录</label>
-        <input id="openlist_root_dir">
-        <label>广告文件名，一行一个</label>
-        <textarea id="delete_names"></textarea>
-        <div class="actions">
-          <button id="saveBtn">保存配置</button>
-        </div>
-      </section>
-    </div>
-
-    <section>
-      <h2>最近资源</h2>
-      <div id="items"></div>
-    </section>
-  </main>
-
-  <script>
-    const $ = (id) => document.getElementById(id);
-    const adminToken = new URLSearchParams(location.search).get("token") || localStorage.getItem("adminToken") || "";
-    if (adminToken) localStorage.setItem("adminToken", adminToken);
-    const fields = [
-      "source_url", "first_run_limit", "fetch_limit", "fetch_interval_seconds",
-      "request_delay_seconds", "quark_cookie", "quark_save_fid", "baidu_cookie",
-      "baidu_new_share_code", "baidu_transfer_dir", "openlist_url",
-      "openlist_token", "openlist_root_dir"
-    ];
-    function msg(text) { $("message").textContent = text || ""; }
-    async function api(path, options = {}) {
-      const headers = { "Content-Type": "application/json" };
-      if (adminToken) headers["X-Admin-Token"] = adminToken;
-      const res = await fetch(path, {
-        headers,
-        ...options
-      });
-      if (!res.ok) throw new Error(await res.text());
-      return await res.json();
-    }
-    async function loadConfig() {
-      const config = await api("/api/config");
-      for (const key of fields) $(key).value = config[key] ?? "";
-      $("enabled").checked = !!config.enabled;
-      $("auto_transfer").checked = !!config.auto_transfer;
-      $("delete_names").value = (config.delete_names || []).join("\n");
-    }
-    async function saveConfig() {
-      const payload = {};
-      for (const key of fields) payload[key] = $(key).value;
-      for (const key of ["first_run_limit", "fetch_limit", "fetch_interval_seconds"]) payload[key] = Number(payload[key]);
-      payload.request_delay_seconds = Number(payload.request_delay_seconds);
-      payload.enabled = $("enabled").checked;
-      payload.auto_transfer = $("auto_transfer").checked;
-      payload.delete_names = $("delete_names").value.split("\n").map(x => x.trim()).filter(Boolean);
-      await api("/api/config", { method: "POST", body: JSON.stringify(payload) });
-      msg("配置已保存");
-      await refresh();
-    }
-    function renderItems(items) {
-      $("items").innerHTML = items.map(item => {
-        const original = (item.provider_links || []).map(link => `<a href="${link.url}" target="_blank">${link.provider}${link.code ? " " + link.code : ""}</a>`).join("");
-        const newer = Object.entries(item.new_links || {}).map(([name, link]) => `<a href="${link.url}" target="_blank">新${name}${link.code ? " " + link.code : ""}</a>`).join("");
-        return `<div class="item">
-          ${item.image_url ? `<img class="thumb" src="${item.image_url}">` : `<div class="thumb"></div>`}
-          <div>
-            <h3>${item.title}</h3>
-            <p>${item.intro || ""}</p>
-            <div class="links">${original}${newer}</div>
-          </div>
-        </div>`;
-      }).join("");
-    }
-    async function refresh() {
-      const status = await api("/api/status");
-      $("total").textContent = status.total_resources;
-      $("transferred").textContent = status.transferred_resources;
-      $("inserted").textContent = status.last_inserted;
-      $("running").textContent = status.busy ? "忙" : (status.running ? "开" : "停");
-      if (status.last_error) msg(status.last_error);
-      const resources = await api("/api/resources?limit=30");
-      renderItems(resources.items || []);
-    }
-    $("saveBtn").onclick = () => saveConfig().catch(e => msg(e.message));
-    $("runBtn").onclick = async () => {
-      msg("抓取中...");
-      await api("/api/run", { method: "POST", body: JSON.stringify({}) }).catch(e => msg(e.message));
-      await refresh();
-    };
-    $("firstBtn").onclick = async () => {
-      msg("首次抓取中...");
-      await api("/api/run", { method: "POST", body: JSON.stringify({ limit: Number($("first_run_limit").value), transfer: $("auto_transfer").checked }) }).catch(e => msg(e.message));
-      await refresh();
-    };
-    $("startBtn").onclick = async () => { await api("/api/start", { method: "POST" }); await loadConfig(); await refresh(); };
-    $("stopBtn").onclick = async () => { await api("/api/stop", { method: "POST" }); await loadConfig(); await refresh(); };
-    loadConfig().then(refresh).catch(e => msg(e.message));
-    setInterval(refresh, 10000);
-  </script>
-</body>
-</html>
-"""
