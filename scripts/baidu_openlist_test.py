@@ -462,8 +462,10 @@ class BaiduPanClient:
         if "surl" in query and query["surl"]:
             value = str(query["surl"][0]).strip()
             return value[1:] if value.startswith("1") else value
-        if parsed.path.startswith("/s/1"):
-            return parsed.path.split("/s/1", 1)[1].strip("/")
+        if parsed.path.startswith("/s/"):
+            value = urllib.parse.unquote(parsed.path.split("/s/", 1)[1].split("/", 1)[0]).strip()
+            if value:
+                return value[1:] if value.startswith("1") else value
         raise ScriptError("无法从百度分享链接中提取 surl")
 
     def verify_pass_code(self, share_url: str, pass_code: str) -> None:
@@ -775,13 +777,16 @@ def main() -> int:
         baidu = BaiduPanClient(cookie=args.baidu_cookie)
 
         baidu.get_bdstoken()
-        baidu.verify_pass_code(args.share_url, args.share_code)
+        try:
+            transfer_params = baidu.get_transfer_params(args.share_url)
+        except ScriptError:
+            baidu.verify_pass_code(args.share_url, args.share_code)
+            transfer_params = baidu.get_transfer_params(args.share_url)
         baidu.ensure_dir(baidu_transfer_dir)
 
         before_entries = baidu.get_dir_list(baidu_transfer_dir)
         before_names = {str(item.get("server_filename") or "") for item in before_entries}
 
-        transfer_params = baidu.get_transfer_params(args.share_url)
         baidu.transfer_file(
             share_id=str(transfer_params["share_id"]),
             user_id=str(transfer_params["user_id"]),
