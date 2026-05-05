@@ -853,7 +853,14 @@ def record_transfer_failure(item: dict[str, Any], errors: list[dict[str, str]]) 
 
 def resource_exists(source_key: str) -> bool:
     with db() as conn:
-        row = conn.execute("select 1 from resources where source_key = ?", (source_key,)).fetchone()
+        row = conn.execute(
+            """
+            select 1
+            from resources
+            where source_key = ? and transferred_at != ''
+            """,
+            (source_key,),
+        ).fetchone()
     return row is not None
 
 
