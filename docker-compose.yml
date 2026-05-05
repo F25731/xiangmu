@@ -7,7 +7,7 @@ services:
       - "127.0.0.1:8080:8080"
     environment:
       APP_DB_PATH: /app/data/resource_service.db
-      APP_ADMIN_TOKEN: ""
+      APP_ADMIN_TOKEN: ${APP_ADMIN_TOKEN:-}
     volumes:
       - ./data:/app/data
       - ./scripts:/app/scripts:ro
