@@ -517,20 +517,74 @@ def store_image_snapshot(resource_id: int, image_url: str) -> bool:
         conn.execute(
             """
             update resources
-            set image_blob = ?, image_mime = ?, image_fetched_at = ?, updated_at = ?
+            set image_url = ?, image_blob = ?, image_mime = ?, image_fetched_at = ?, updated_at = ?
             where id = ?
             """,
-            (content, mime, fetched_at, now_iso(), int(resource_id)),
+            (image_url, content, mime, fetched_at, now_iso(), int(resource_id)),
         )
     return True
 
 
+def find_source_item_by_title(items: list[dict[str, Any]], title: str) -> Optional[dict[str, Any]]:
+    for item in items:
+        if same_title(str(item.get("title") or ""), title):
+            return item
+    return None
+
+
+def image_snapshot_for_item(
+    item: dict[str, Any],
+    source_items: Optional[list[dict[str, Any]]] = None,
+) -> tuple[bytes, str, str] | None:
+    snapshot = fetch_image_snapshot(str(item.get("image_url") or ""))
+    if snapshot:
+        return snapshot
+
+    source_item = find_source_item_by_title(source_items or [], str(item.get("title") or ""))
+    source_image_url = str((source_item or {}).get("image_url") or "")
+    if source_image_url and source_image_url != str(item.get("image_url") or ""):
+        snapshot = fetch_image_snapshot(source_image_url)
+        if snapshot:
+            item["image_url"] = source_image_url
+            return snapshot
+    return None
+
+
+async def store_image_with_source_refresh(
+    resource_id: int,
+    title: str,
+    image_url: str,
+    config: dict[str, Any],
+    source_items: Optional[list[dict[str, Any]]] = None,
+) -> bool:
+    if await asyncio.to_thread(store_image_snapshot, resource_id, image_url):
+        return True
+
+    items = source_items
+    if items is None:
+        try:
+            items = await fetch_source(config, int(config.get("scan_limit") or config.get("fetch_limit") or 80))
+        except Exception as exc:
+            log_event("warning", f"图片回源失败：{title} {exc}")
+            return False
+    source_item = find_source_item_by_title(items, title)
+    source_image_url = str((source_item or {}).get("image_url") or "")
+    if not source_image_url or source_image_url == image_url:
+        log_event("warning", f"图片缓存失败，源站未找到新图片：{title}")
+        return False
+    ok = await asyncio.to_thread(store_image_snapshot, resource_id, source_image_url)
+    if not ok:
+        log_event("warning", f"图片缓存失败，源站新图片也不可用：{title}")
+    return ok
+
+
 async def backfill_missing_images(limit: int = 200) -> None:
     await asyncio.sleep(3)
+    config = load_config()
     with db() as conn:
         rows = conn.execute(
             """
-            select id, image_url
+            select id, title, image_url
             from resources
             where image_url != ''
             and image_blob is null
@@ -539,10 +593,30 @@ async def backfill_missing_images(limit: int = 200) -> None:
             """,
             (int(limit),),
         ).fetchall()
+    source_items: Optional[list[dict[str, Any]]] = None
     for row in rows:
         ok = await asyncio.to_thread(store_image_snapshot, int(row["id"]), str(row["image_url"] or ""))
+        if not ok:
+            if source_items is None:
+                try:
+                    source_items = await fetch_source(
+                        config,
+                        max(int(limit), int(config.get("scan_limit") or config.get("fetch_limit") or 80)),
+                    )
+                except Exception as exc:
+                    source_items = []
+                    log_event("warning", f"图片补齐回源失败：{exc}")
+            ok = await store_image_with_source_refresh(
+                int(row["id"]),
+                str(row["title"] or ""),
+                str(row["image_url"] or ""),
+                config,
+                source_items,
+            )
         if ok:
             log_event("info", f"图片已缓存到数据库：resource #{row['id']}")
+        else:
+            log_event("warning", f"图片仍未缓存：resource #{row['id']} {row['title']}")
         await asyncio.sleep(0.5)
 
 
@@ -900,13 +974,17 @@ def links_to_new_links(links: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def insert_transferred_resource(item: dict[str, Any], links: list[dict[str, Any]] | dict[str, Any]) -> dict[str, Any]:
+def insert_transferred_resource(
+    item: dict[str, Any],
+    links: list[dict[str, Any]] | dict[str, Any],
+    source_items: Optional[list[dict[str, Any]]] = None,
+) -> dict[str, Any]:
     stamp = now_iso()
     if isinstance(links, dict):
         links = [links]
     item["intro"] = ensure_intro_punctuation(clean_resource_intro(str(item.get("intro") or "")))
     new_links = links_to_new_links(links)
-    snapshot = fetch_image_snapshot(str(item.get("image_url") or ""))
+    snapshot = image_snapshot_for_item(item, source_items)
     image_blob = snapshot[0] if snapshot else None
     image_mime = snapshot[1] if snapshot else ""
     image_fetched_at = snapshot[2] if snapshot else ""
@@ -1190,7 +1268,7 @@ async def run_fetch_once(limit: Optional[int] = None, retry_failures: Optional[b
                     continue
                 successes, errors = await asyncio.to_thread(transfer_item_all, item, config)
                 if successes:
-                    await asyncio.to_thread(insert_transferred_resource, item, successes)
+                    await asyncio.to_thread(insert_transferred_resource, item, successes, items)
                     transferred += 1
                     if errors:
                         await asyncio.to_thread(record_transfer_failures, item, errors)
@@ -1291,7 +1369,7 @@ async def index() -> str:
 async def api_resource_image(resource_id: int) -> Response:
     with db() as conn:
         row = conn.execute(
-            "select image_blob, image_mime, image_url from resources where id = ?",
+            "select title, image_blob, image_mime, image_url from resources where id = ?",
             (resource_id,),
         ).fetchone()
     if not row:
@@ -1303,7 +1381,13 @@ async def api_resource_image(resource_id: int) -> Response:
 
     image_url = str(row["image_url"] or "")
     if image_url:
-        await asyncio.to_thread(store_image_snapshot, resource_id, image_url)
+        await store_image_with_source_refresh(
+            resource_id,
+            str(row["title"] or ""),
+            image_url,
+            load_config(),
+            None,
+        )
         with db() as conn:
             fresh = conn.execute(
                 "select image_blob, image_mime from resources where id = ?",
