@@ -18,7 +18,7 @@ from urllib.parse import parse_qs, urljoin, urlparse
 import httpx
 from bs4 import BeautifulSoup, Tag
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel, Field
 
 
@@ -26,6 +26,7 @@ APP_DIR = Path(__file__).resolve().parent
 DB_PATH = Path(os.getenv("APP_DB_PATH", APP_DIR / "data" / "resource_service.db"))
 ADMIN_TOKEN = os.getenv("APP_ADMIN_TOKEN", "").strip()
 PAN_HOSTS = ("pan.quark.cn", "pan.baidu.com")
+MAX_IMAGE_BYTES = 3 * 1024 * 1024
 
 
 DEFAULT_CONFIG: dict[str, Any] = {
@@ -221,6 +222,9 @@ def init_db() -> None:
                 title text not null,
                 intro text not null,
                 image_url text not null,
+                image_blob blob,
+                image_mime text not null default '',
+                image_fetched_at text not null default '',
                 provider_links text not null,
                 new_links text not null default '{}',
                 raw text not null default '{}',
@@ -290,6 +294,9 @@ def init_db() -> None:
         )
         ensure_column(conn, "resources", "source_rank", "integer not null default 999999")
         ensure_column(conn, "resources", "push_count", "integer not null default 0")
+        ensure_column(conn, "resources", "image_blob", "blob")
+        ensure_column(conn, "resources", "image_mime", "text not null default ''")
+        ensure_column(conn, "resources", "image_fetched_at", "text not null default ''")
         existing = {
             row["key"]
             for row in conn.execute("select key from config").fetchall()
@@ -378,11 +385,15 @@ def row_to_resource(row: sqlite3.Row) -> dict[str, Any]:
 
 
 def public_resource(item: dict[str, Any]) -> dict[str, Any]:
+    image_url = ""
+    if item.get("image_blob") or item.get("image_url"):
+        image_url = f"/api/resources/{item['id']}/image"
     return {
         "id": item["id"],
         "title": item["title"],
         "intro": item["intro"],
-        "image_url": item["image_url"],
+        "image_url": image_url,
+        "original_image_url": item.get("image_url", ""),
         "links": item.get("new_links") or {},
         "new_links": item.get("new_links") or {},
         "transferred_at": item.get("transferred_at", ""),
@@ -471,6 +482,68 @@ def sanitize_existing_intros(conn: sqlite3.Connection) -> None:
                 "update transfer_failures set item_json = ?, updated_at = ? where id = ?",
                 (json.dumps(item, ensure_ascii=False), now_iso(), row["id"]),
             )
+
+
+def fetch_image_snapshot(url: str) -> tuple[bytes, str, str] | None:
+    image_url = str(url or "").strip()
+    if not image_url:
+        return None
+    try:
+        with httpx.Client(
+            timeout=30,
+            follow_redirects=True,
+            trust_env=False,
+            headers={"User-Agent": DEFAULT_CONFIG["user_agent"]},
+        ) as client:
+            response = client.get(image_url)
+            response.raise_for_status()
+        mime = str(response.headers.get("content-type") or "").split(";", 1)[0].strip().lower()
+        if not mime.startswith("image/"):
+            return None
+        content = bytes(response.content)
+        if not content or len(content) > MAX_IMAGE_BYTES:
+            return None
+        return content, mime, now_iso()
+    except Exception:
+        return None
+
+
+def store_image_snapshot(resource_id: int, image_url: str) -> bool:
+    snapshot = fetch_image_snapshot(image_url)
+    if not snapshot:
+        return False
+    content, mime, fetched_at = snapshot
+    with db() as conn:
+        conn.execute(
+            """
+            update resources
+            set image_blob = ?, image_mime = ?, image_fetched_at = ?, updated_at = ?
+            where id = ?
+            """,
+            (content, mime, fetched_at, now_iso(), int(resource_id)),
+        )
+    return True
+
+
+async def backfill_missing_images(limit: int = 200) -> None:
+    await asyncio.sleep(3)
+    with db() as conn:
+        rows = conn.execute(
+            """
+            select id, image_url
+            from resources
+            where image_url != ''
+            and image_blob is null
+            order by source_rank asc, id asc
+            limit ?
+            """,
+            (int(limit),),
+        ).fetchall()
+    for row in rows:
+        ok = await asyncio.to_thread(store_image_snapshot, int(row["id"]), str(row["image_url"] or ""))
+        if ok:
+            log_event("info", f"图片已缓存到数据库：resource #{row['id']}")
+        await asyncio.sleep(0.5)
 
 
 def provider_for_url(url: str) -> str:
@@ -833,18 +906,26 @@ def insert_transferred_resource(item: dict[str, Any], links: list[dict[str, Any]
         links = [links]
     item["intro"] = ensure_intro_punctuation(clean_resource_intro(str(item.get("intro") or "")))
     new_links = links_to_new_links(links)
+    snapshot = fetch_image_snapshot(str(item.get("image_url") or ""))
+    image_blob = snapshot[0] if snapshot else None
+    image_mime = snapshot[1] if snapshot else ""
+    image_fetched_at = snapshot[2] if snapshot else ""
     with db() as conn:
         conn.execute(
             """
             insert into resources(
                 source_key, source_url, title, intro, image_url,
+                image_blob, image_mime, image_fetched_at,
                 provider_links, new_links, raw, source_rank,
                 transferred_at, created_at, updated_at
-            ) values(?, ?, ?, ?, ?, '[]', ?, ?, ?, ?, ?, ?)
+            ) values(?, ?, ?, ?, ?, ?, ?, ?, '[]', ?, ?, ?, ?, ?, ?)
             on conflict(source_key) do update set
                 title = excluded.title,
                 intro = excluded.intro,
                 image_url = excluded.image_url,
+                image_blob = coalesce(excluded.image_blob, image_blob),
+                image_mime = coalesce(nullif(excluded.image_mime, ''), image_mime),
+                image_fetched_at = coalesce(nullif(excluded.image_fetched_at, ''), image_fetched_at),
                 provider_links = '[]',
                 new_links = excluded.new_links,
                 raw = excluded.raw,
@@ -858,6 +939,9 @@ def insert_transferred_resource(item: dict[str, Any], links: list[dict[str, Any]
                 item["title"],
                 item["intro"],
                 item["image_url"],
+                image_blob,
+                image_mime,
+                image_fetched_at,
                 json.dumps(new_links, ensure_ascii=False),
                 json.dumps(item.get("raw") or {}, ensure_ascii=False),
                 int(item.get("source_rank") or 999999),
@@ -1188,6 +1272,7 @@ async def on_startup() -> None:
     init_db()
     save_config({})
     runtime_status["running"] = True
+    asyncio.create_task(backfill_missing_images())
     scheduler_task = asyncio.create_task(scheduler_loop())
 
 
@@ -1200,6 +1285,36 @@ async def on_shutdown() -> None:
 @app.get("/", response_class=HTMLResponse)
 async def index() -> str:
     return (APP_DIR / "static" / "index.html").read_text(encoding="utf-8")
+
+
+@app.get("/api/resources/{resource_id}/image")
+async def api_resource_image(resource_id: int) -> Response:
+    with db() as conn:
+        row = conn.execute(
+            "select image_blob, image_mime, image_url from resources where id = ?",
+            (resource_id,),
+        ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="resource not found")
+    blob = row["image_blob"]
+    mime = str(row["image_mime"] or "image/jpeg")
+    if blob:
+        return Response(content=bytes(blob), media_type=mime)
+
+    image_url = str(row["image_url"] or "")
+    if image_url:
+        await asyncio.to_thread(store_image_snapshot, resource_id, image_url)
+        with db() as conn:
+            fresh = conn.execute(
+                "select image_blob, image_mime from resources where id = ?",
+                (resource_id,),
+            ).fetchone()
+        if fresh and fresh["image_blob"]:
+            return Response(
+                content=bytes(fresh["image_blob"]),
+                media_type=str(fresh["image_mime"] or "image/jpeg"),
+            )
+    raise HTTPException(status_code=404, detail="image not available")
 
 
 @app.get("/api/config", dependencies=[Depends(require_admin)])
@@ -1232,6 +1347,12 @@ async def api_status() -> Dict[str, Any]:
         "failure_resources": failures,
         "recent_runs": recent_runs,
     }
+
+
+@app.post("/api/images/backfill", dependencies=[Depends(require_admin)])
+async def api_backfill_images(limit: int = Query(200, ge=1, le=1000)) -> Dict[str, Any]:
+    asyncio.create_task(backfill_missing_images(limit))
+    return {"queued": True, "limit": limit}
 
 
 @app.post("/api/run", dependencies=[Depends(require_admin)])
@@ -1268,7 +1389,7 @@ async def api_resources(
         total = conn.execute(
             "select count(*) as c from resources where transferred_at != ''"
         ).fetchone()["c"]
-    return {"total": total, "items": [row_to_resource(row) for row in rows]}
+    return {"total": total, "items": [public_resource(row_to_resource(row)) for row in rows]}
 
 
 @app.get("/api/resources/latest")
