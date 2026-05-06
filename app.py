@@ -962,6 +962,35 @@ def update_resource_rank(source_key: str, rank: int) -> None:
         )
 
 
+def same_title(left: str, right: str) -> bool:
+    return clean_text(left).strip("《》") == clean_text(right).strip("《》")
+
+
+async def refill_provider_links_from_source(
+    resource: dict[str, Any],
+    config: dict[str, Any],
+    providers: set[str],
+) -> dict[str, Any]:
+    limit = int(config.get("scan_limit") or config.get("fetch_limit") or 80)
+    items = await fetch_source(config, limit)
+    for item in items:
+        if same_title(str(item.get("title") or ""), str(resource.get("title") or "")):
+            links = [
+                link
+                for link in item.get("provider_links", [])
+                if str(link.get("provider") or "") in providers
+            ]
+            if not links:
+                break
+            merged = dict(resource)
+            merged["provider_links"] = links
+            merged["source_url"] = item.get("source_url") or resource.get("source_url") or str(config["source_url"])
+            merged["raw"] = item.get("raw") or resource.get("raw") or {}
+            merged["intro"] = resource.get("intro") or item.get("intro") or ""
+            return merged
+    raise RuntimeError(f"source links not found for resource: {resource.get('title')}")
+
+
 def transfer_resource(resource: dict[str, Any], config: dict[str, Any], providers: Optional[List[str]] = None) -> dict[str, Any]:
     wanted = set(providers or ["quark", "baidu"])
     source_links = [
@@ -978,6 +1007,8 @@ def transfer_resource(resource: dict[str, Any], config: dict[str, Any], provider
     if errors:
         record_transfer_failures(item, errors)
     if resource.get("id"):
+        merged_links = dict(resource.get("new_links") or {})
+        merged_links.update(new_links)
         with db() as conn:
             conn.execute(
                 """
@@ -986,12 +1017,13 @@ def transfer_resource(resource: dict[str, Any], config: dict[str, Any], provider
                 where id = ?
                 """,
                 (
-                    json.dumps(new_links, ensure_ascii=False),
+                    json.dumps(merged_links, ensure_ascii=False),
                     now_iso(),
                     now_iso(),
                     resource["id"],
                 ),
             )
+        return merged_links
     return new_links
 
 
@@ -1371,5 +1403,13 @@ async def api_transfer(resource_id: int, payload: TransferIn) -> Dict[str, Any]:
     if not row:
         raise HTTPException(status_code=404, detail="resource not found")
     resource = row_to_resource(row)
+    wanted = set(payload.providers or ["quark", "baidu"])
+    source_links = [
+        link
+        for link in resource.get("provider_links", [])
+        if str(link.get("provider") or "") in wanted
+    ]
+    if not source_links:
+        resource = await refill_provider_links_from_source(resource, config, wanted)
     links = await asyncio.to_thread(transfer_resource, resource, config, payload.providers)
     return {"new_links": links}
