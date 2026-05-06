@@ -402,6 +402,18 @@ def public_resource(item: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def resource_order_sql(order: str, alias: str = "") -> str:
+    prefix = f"{alias}." if alias else ""
+    value = (order or "latest").strip().lower()
+    if value in {"latest", "source"}:
+        return f"{prefix}source_rank asc, {prefix}id asc"
+    if value == "oldest":
+        return f"{prefix}source_rank desc, {prefix}id desc"
+    if value in {"created", "created_desc"}:
+        return f"{prefix}created_at desc, {prefix}id desc"
+    raise HTTPException(status_code=400, detail="order must be latest, source, oldest, or created")
+
+
 def mark_delivered(client_id: str, resource_ids: list[int]) -> None:
     if not client_id or not resource_ids:
         return
@@ -1459,13 +1471,15 @@ async def api_stop() -> Dict[str, Any]:
 async def api_resources(
     limit: int = Query(50, ge=1, le=500),
     offset: int = Query(0, ge=0),
+    order: str = Query("latest"),
 ) -> Dict[str, Any]:
+    order_sql = resource_order_sql(order)
     with db() as conn:
         rows = conn.execute(
-            """
+            f"""
             select * from resources
             where transferred_at != ''
-            order by source_rank asc, id asc
+            order by {order_sql}
             limit ? offset ?
             """,
             (limit, offset),
@@ -1477,13 +1491,17 @@ async def api_resources(
 
 
 @app.get("/api/resources/latest")
-async def api_latest(limit: int = Query(20, ge=1, le=200)) -> Dict[str, Any]:
+async def api_latest(
+    limit: int = Query(20, ge=1, le=200),
+    order: str = Query("latest"),
+) -> Dict[str, Any]:
+    order_sql = resource_order_sql(order)
     with db() as conn:
         rows = conn.execute(
-            """
+            f"""
             select * from resources
             where transferred_at != ''
-            order by source_rank asc, id asc
+            order by {order_sql}
             limit ?
             """,
             (limit,),
@@ -1539,7 +1557,9 @@ async def api_client_pending(
     first_limit: int = Query(20, ge=1, le=500),
     mark: bool = Query(True),
     ensure: bool = Query(True),
+    order: str = Query("latest"),
 ) -> Dict[str, Any]:
+    order_sql = resource_order_sql(order, "r")
     with db() as conn:
         delivered_count = conn.execute(
             "select count(*) as c from delivery_marks where client_id = ?",
@@ -1569,7 +1589,7 @@ async def api_client_pending(
 
     with db() as conn:
         rows = conn.execute(
-            """
+            f"""
             select r.*
             from resources r
             where r.transferred_at != ''
@@ -1577,7 +1597,7 @@ async def api_client_pending(
                 select 1 from delivery_marks d
                 where d.client_id = ? and d.resource_id = r.id
             )
-            order by r.source_rank asc, r.id asc
+            order by {order_sql}
             limit ?
             """,
             (client_id, actual_limit),
